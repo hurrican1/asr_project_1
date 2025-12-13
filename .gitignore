@@ -1,13 +1,20 @@
+.DS_Store
+.env
+
 venv/
 .venv/
 __pycache__/
 *.py[cod]
 *.log
+
+# audio files should NOT be committed
 audio/*
 !audio/.gitkeep
+
+# runtime outputs
 result.txt
 result.json
-*.pt
-*.safetensors
+
+# model caches
 huggingface/
 .cache/
