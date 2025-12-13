@@ -1,12 +1,8 @@
-# Базовый стек: PyTorch + torchaudio
-torch==2.8.0
-torchaudio==2.8.0
-
-# WhisperX ASR + выравнивание
+# ASR stack
 whisperx==3.7.4
-
-# Pyannote 3.x для VAD/диаризации (последняя стабильная 3.x на момент подготовки)
 pyannote.audio==3.4.0
-
-# Для фикса pickle в PyTorch 2.6+ (pyannote модели используют OmegaConf)
 omegaconf>=2.3.0,<3.0.0
+
+# Telegram bot
+python-telegram-bot==21.6
+httpx~=0.27
