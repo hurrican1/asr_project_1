@@ -12,9 +12,10 @@ fi
 
 AUDIO_PATH="${1:-}"
 LANG="${2:-ru}"
+OUT_DIR="${3:-.}"
 
 if [[ -z "$AUDIO_PATH" ]]; then
-  echo "Usage: $0 <audio_path> [lang]"
+  echo "Usage: $0 <audio_path> [lang] [out_dir]"
   exit 2
 fi
 
@@ -35,5 +36,4 @@ if [[ -n "$NVIDIA_LIBS" ]]; then
   export LD_LIBRARY_PATH="$NVIDIA_LIBS"
 fi
 
-# Run ASR (run_asr.py itself loads .env if present)
-python run_asr.py --audio_path "$AUDIO_PATH" --language "$LANG"
+python run_asr.py --audio_path "$AUDIO_PATH" --language "$LANG" --out_dir "$OUT_DIR"
