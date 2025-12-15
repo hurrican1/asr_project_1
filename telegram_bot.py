@@ -587,7 +587,7 @@ def generate_protocol_map_reduce(
 
     extracts: List[Dict[str, Any]] = []
     for idx, ch in enumerate(chunks, start=1):
-        input_text = f"ЧАСТЬ {idx}/{len(chunks)}\n{ch}"
+        input_text = f"Верни результат строго в json (json_object). Только json.\nЧАСТЬ {idx}/{len(chunks)}\n{ch}"
 
         out_text = openai_call_with_backoff(
             client,
