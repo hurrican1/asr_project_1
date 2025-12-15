@@ -9,3 +9,6 @@ httpx~=0.27
 
 # --- GPT / Protocol ---
 openai>=1.30.0
+
+# --- Word export (protocol.docx) ---
+python-docx>=1.1.0

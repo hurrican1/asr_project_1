@@ -25,8 +25,8 @@ from telegram.ext import (
 )
 
 from voice_db import add_voiceprint, list_speakers, load_db, save_db
+from protocol_docx import build_protocol_docx
 
-# Optional: only required for /protocol
 try:
     from openai import OpenAI  # type: ignore
 except Exception:  # pragma: no cover
@@ -97,20 +97,27 @@ DEFAULT_LANG = os.getenv("ASR_LANGUAGE", "ru")
 
 MAX_TELEGRAM_TEXT = int(os.getenv("MAX_TELEGRAM_TEXT", "3800"))
 
+# Telegram Bot API practical download limit (bot side): ~20MB
 TG_MAX_DOWNLOAD_BYTES = int(os.getenv("TG_MAX_DOWNLOAD_MB", "20")) * 1024 * 1024
+
+# URL download max safeguard (avoid filling disk)
 URL_MAX_DOWNLOAD_BYTES = int(os.getenv("URL_MAX_DOWNLOAD_MB", "2048")) * 1024 * 1024  # default 2GB
 
 DELETE_AUDIO_AFTER_PROCESS = env_bool("DELETE_AUDIO_AFTER_PROCESS", default=False)
 
-PROCESS_LOCK = asyncio.Lock()     # One GPU -> one ASR job at a time
-VOICE_DB_LOCK = asyncio.Lock()    # Protect voice_db.json writes
-PROTOCOL_LOCK = asyncio.Lock()    # Avoid parallel /protocol (cost + rate limits)
+# One GPU => process one job at a time (safe MVP)
+PROCESS_LOCK = asyncio.Lock()
+
+# Protect concurrent /label updates
+VOICE_DB_LOCK = asyncio.Lock()
+
+# Avoid parallel /protocol (cost + rate limits)
+PROTOCOL_LOCK = asyncio.Lock()
 
 URL_RE = re.compile(r"(https?://\S+)", re.IGNORECASE)
 
 
-# ---------------- Protocol prompts ----------------
-# 1) Extraction prompt (small output JSON for each chunk)
+# ---------------- Protocol (Map-Reduce) ----------------
 EXTRACT_INSTRUCTIONS = """
 Роль модели:
 Ты — корпоративный секретарь и PMO-аналитик.
@@ -140,215 +147,13 @@ EXTRACT_INSTRUCTIONS = """
   "open_questions": [string],
   "next_meeting": {"datetime": string, "topic": string}
 }
-
-Подсказка:
-- agenda: 1–6 пунктов на фрагмент (если есть).
-- key_points: 2–6 пунктов на фрагмент (если есть).
 """.strip()
 
-# 2) Final protocol template (your strict format)
-PROTOCOL_TEMPLATE = """
-ПРОТОКОЛ СОВЕЩАНИЯ
-1. Общая информация
-
-Дата: {date}
-Время: {time}
-Формат: {format}
-Тема: {topic}
-Участники:
-{participants}
-
-2. Повестка (что обсуждали)
-{agenda}
-
-3. Ключевые тезисы обсуждения (кратко)
-{key_points}
-
-4. Принятые решения
-{decisions}
-
-5. Задачи и поручения (Action Items)
-№ | Задача | Ответственный | Срок | Критерий готовности / результат
-{action_items_table}
-
-6. Риски и блокеры
-{risks}
-
-7. Открытые вопросы
-{open_questions}
-
-8. Следующая встреча
-
-Дата/время: {next_datetime}
-Предварительная тема: {next_topic}
-""".strip()
-
-
-# ---------------- Utilities ----------------
-def ext_from_url(url: str) -> str:
-    try:
-        path = urlparse(url).path
-        if "." in path:
-            ext = path.rsplit(".", 1)[-1].lower()
-            if 1 <= len(ext) <= 6:
-                return ext
-    except Exception:
-        pass
-    return "m4a"
-
-
-def is_http_url(url: str) -> bool:
-    try:
-        u = urlparse(url)
-        return u.scheme in ("http", "https") and bool(u.netloc)
-    except Exception:
-        return False
-
-
-async def download_by_url(url: str, dest: Path, max_bytes: int) -> int:
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(dest.suffix + ".part")
-
-    timeout = httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=30.0)
-    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
-        async with client.stream("GET", url) as r:
-            r.raise_for_status()
-            total = int(r.headers.get("Content-Length") or 0)
-            if total and total > max_bytes:
-                raise RuntimeError(f"File too large by Content-Length: {total/1024/1024:.1f} MB")
-
-            downloaded = 0
-            with open(tmp, "wb") as f:
-                async for chunk in r.aiter_bytes(chunk_size=1024 * 1024):
-                    if not chunk:
-                        continue
-                    downloaded += len(chunk)
-                    if downloaded > max_bytes:
-                        raise RuntimeError("File too large while downloading (limit exceeded).")
-                    f.write(chunk)
-
-    tmp.replace(dest)
-    return downloaded
-
-
-async def run_asr(local_audio_path: Path, lang: str, out_dir: Path) -> subprocess.CompletedProcess:
-    if not RUN_SCRIPT.exists():
-        raise RuntimeError(f"run script not found: {RUN_SCRIPT}")
-
-    cmd = [str(RUN_SCRIPT), str(local_audio_path), lang, str(out_dir)]
-    logger.info("Running ASR: %s", " ".join(cmd))
-
-    return await asyncio.to_thread(
-        subprocess.run,
-        cmd,
-        cwd=str(BASE_DIR),
-        capture_output=True,
-        text=True,
-    )
-
-
-def read_json(path: Path) -> Optional[Dict[str, Any]]:
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-
-
-def format_ts(seconds: float) -> str:
-    ms = int(round(float(seconds) * 1000))
-    s, ms = divmod(ms, 1000)
-    m, s = divmod(s, 60)
-    h, m = divmod(m, 60)
-    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
-
-
-def render_segments_to_text(segments: List[Dict[str, Any]]) -> str:
-    lines: List[str] = []
-    for s in segments:
-        try:
-            lines.append(
-                f"[{format_ts(s['start'])} --> {format_ts(s['end'])}] {s['speaker']}: {s.get('text','')}"
-            )
-        except Exception:
-            continue
-    return "\n".join(lines)
-
-
-async def reply_document_from_path(msg, path: Path, caption: Optional[str] = None) -> None:
-    with path.open("rb") as f:
-        await msg.reply_document(document=InputFile(f, filename=path.name), caption=caption)
-
-
-async def reply_text_or_file(msg, text: str, *, file_path: Optional[Path] = None, caption: Optional[str] = None) -> None:
-    text = (text or "").strip()
-    if len(text) <= MAX_TELEGRAM_TEXT:
-        if caption:
-            await msg.reply_text(f"{caption}\n\n{text}" if text else caption)
-        else:
-            await msg.reply_text(text if text else "(пусто)")
-        return
-
-    if file_path and file_path.exists():
-        await reply_document_from_path(msg, file_path, caption=caption)
-        return
-
-    tmp = BASE_DIR / f"long_{uuid.uuid4().hex}.txt"
-    tmp.write_text(text, encoding="utf-8")
-    try:
-        await reply_document_from_path(msg, tmp, caption=caption)
-    finally:
-        try:
-            if tmp.exists():
-                tmp.unlink()
-        except Exception:
-            pass
-
-
-async def post_unknown_prompt(msg, job_id: str, job_dir: Path) -> None:
-    payload = read_json(job_dir / "result.json")
-    if not payload:
-        return
-
-    unknowns = payload.get("unknown_speakers") or []
-    if not unknowns:
-        return
-
-    lines = ["Обнаружены неизвестные говорящие:"]
-    for u in unknowns:
-        unk_id = u.get("id")
-        label = u.get("label")
-        if unk_id and label:
-            lines.append(f"- {unk_id} = {label}")
-
-    lines.append("")
-    lines.append("Чтобы назвать и запомнить голос, отправьте команду:")
-    lines.append(f"/label {job_id} UNKNOWN_1 Иван")
-    lines.append("(подставьте ваш UNKNOWN_k и имя)")
-
-    await msg.reply_text("\n".join(lines))
-
-
-def extract_participants(job_dir: Path) -> List[str]:
-    payload = read_json(job_dir / "result.json")
-    if not payload:
-        return []
-
-    participants: List[str] = []
-    for seg in (payload.get("segments") or []):
-        sp = seg.get("speaker")
-        if sp and sp not in participants:
-            participants.append(sp)
-    return participants
-
-
-# ---------------- Protocol (Map-Reduce) ----------------
+# Remove timestamps to save tokens: [00:00:00.000 --> 00:00:10.000]
 TS_RE = re.compile(r"^\[\d{2}:\d{2}:\d{2}\.\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}\.\d{3}\]\s*", re.M)
 
 
 def strip_timestamps(transcript: str) -> str:
-    # Remove leading "[.. --> ..]" at each line start to save tokens
     return TS_RE.sub("", transcript).strip()
 
 
@@ -359,7 +164,6 @@ def normalize_space(s: str) -> str:
 def estimate_tokens(text: str, chars_per_token: float) -> int:
     """
     Conservative token estimator. Smaller chars_per_token => larger estimate => safer.
-    Default chars_per_token ~ 3.0 for Cyrillic safety.
     """
     text = text or ""
     if not text:
@@ -368,9 +172,6 @@ def estimate_tokens(text: str, chars_per_token: float) -> int:
 
 
 def chunk_by_lines(text: str, *, max_input_tokens_est: int, chars_per_token: float) -> List[str]:
-    """
-    Chunk transcript by lines (speaker lines) to keep structure.
-    """
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     chunks: List[str] = []
     buf: List[str] = []
@@ -392,9 +193,6 @@ def chunk_by_lines(text: str, *, max_input_tokens_est: int, chars_per_token: flo
 
 
 def parse_json_robust(text: str) -> Dict[str, Any]:
-    """
-    Robust JSON parsing for model outputs (in case it accidentally adds extra chars).
-    """
     raw = (text or "").strip()
 
     # Remove fenced code blocks if any
@@ -419,8 +217,6 @@ def parse_json_robust(text: str) -> Dict[str, Any]:
 class TokenRateLimiter:
     """
     Simple TPM limiter using estimated tokens over the last 60 seconds.
-
-    This helps avoid 429 TPM bursts for long multi-chunk protocols.
     """
     def __init__(self, tpm_limit: int):
         self.tpm_limit = max(1, int(tpm_limit))
@@ -430,10 +226,6 @@ class TokenRateLimiter:
     def _prune(self, now: float) -> None:
         while self.events and (now - self.events[0][0]) > self.window_sec:
             self.events.popleft()
-
-    def used(self, now: float) -> int:
-        self._prune(now)
-        return sum(t for _, t in self.events)
 
     def wait_for_budget(self, tokens_needed: int) -> None:
         tokens_needed = max(0, int(tokens_needed))
@@ -445,13 +237,11 @@ class TokenRateLimiter:
                 self.events.append((now, tokens_needed))
                 return
 
-            # Need to wait until enough old tokens expire
             if not self.events:
-                # should not happen, but just in case
                 time.sleep(1.0)
                 continue
 
-            oldest_ts, oldest_tokens = self.events[0]
+            oldest_ts, _ = self.events[0]
             wait_s = (oldest_ts + self.window_sec) - now
             wait_s = max(0.2, min(wait_s, 20.0))
             time.sleep(wait_s)
@@ -465,7 +255,6 @@ def openai_call_with_backoff(
     input_text: str,
     max_output_tokens: int,
     temperature: float,
-    store: bool,
     limiter: TokenRateLimiter,
     chars_per_token: float,
     max_retries: int = 8,
@@ -473,9 +262,9 @@ def openai_call_with_backoff(
     """
     Synchronous call with:
     - local TPM throttling (estimated)
+    - JSON mode (text.format=json_object)
     - retry on 429 with exponential backoff + jitter
     """
-    # Conservative estimate includes instructions + input + output
     est = (
         estimate_tokens(instructions, chars_per_token)
         + estimate_tokens(input_text, chars_per_token)
@@ -490,15 +279,28 @@ def openai_call_with_backoff(
                 model=model,
                 instructions=instructions,
                 input=input_text,
+                # JSON mode: force valid JSON object
+                text={"format": {"type": "json_object"}},
                 max_output_tokens=max_output_tokens,
                 temperature=temperature,
-                store=store,
+                store=False,
             )
+
+            if getattr(resp, "status", None) == "incomplete":
+                reason = None
+                try:
+                    reason = getattr(getattr(resp, "incomplete_details", None), "reason", None)
+                except Exception:
+                    reason = None
+                raise RuntimeError(
+                    f"OpenAI ответ incomplete ({reason}). "
+                    f"Увеличьте PROTOCOL_EXTRACT_OUT_TOKENS или уменьшите PROTOCOL_CHUNK_TOKENS."
+                )
+
             return (getattr(resp, "output_text", "") or "").strip()
 
         except Exception as e:
             msg = str(e)
-            # Retry only on likely rate-limit signals
             if ("429" in msg) or ("rate_limit" in msg) or ("TPM" in msg) or ("tokens per min" in msg):
                 sleep_s = min((2 ** attempt) + random.random(), 30.0)
                 time.sleep(sleep_s)
@@ -509,9 +311,6 @@ def openai_call_with_backoff(
 
 
 def normalize_extract_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Ensure keys exist and types are sane.
-    """
     def as_list(x) -> List[Any]:
         return x if isinstance(x, list) else []
 
@@ -638,10 +437,8 @@ def merge_extracts(extracts: List[Dict[str, Any]]) -> Dict[str, Any]:
     merged["numbers_facts"] = dedup_str_list(merged["numbers_facts"])
     merged["open_questions"] = dedup_str_list(merged["open_questions"])
 
-    # Mix numbers/facts into key points (no extra sections allowed)
     merged["key_points"] = dedup_str_list(merged["key_points"] + merged["numbers_facts"])
 
-    # Apply caps to keep protocol compact
     merged["agenda"] = merged["agenda"][:12]
     merged["key_points"] = merged["key_points"][:12]
     merged["decisions"] = merged["decisions"][:30]
@@ -652,48 +449,70 @@ def merge_extracts(extracts: List[Dict[str, Any]]) -> Dict[str, Any]:
     return merged
 
 
-def build_protocol_text(
-    merged: Dict[str, Any],
-    *,
-    participants: List[str],
-    topic: Optional[str],
-) -> str:
-    # 1) General info (we do not invent)
-    date = "не указано"
-    time_s = "не указано"
-    fmt = "не указано"
-    topic_s = normalize_space(topic) if topic else "не указано"
+PROTOCOL_TEXT_TEMPLATE = """
+ПРОТОКОЛ СОВЕЩАНИЯ
+1. Общая информация
 
-    participants_lines = participants if participants else ["не указано"]
-    participants_block = "\n".join(participants_lines)
+Дата: {date}
+Время: {time}
+Формат: {format}
+Тема: {topic}
+Участники:
+{participants}
 
-    # 2) Agenda
-    agenda_list = merged.get("agenda") or []
-    agenda_block = "\n".join(agenda_list) if agenda_list else "не указано"
+2. Повестка (что обсуждали)
+{agenda}
 
-    # 3) Key points
-    kp_list = merged.get("key_points") or []
-    key_points_block = "\n".join(kp_list) if kp_list else "не указано"
+3. Ключевые тезисы обсуждения (кратко)
+{key_points}
 
-    # 4) Decisions
-    dec_list = merged.get("decisions") or []
-    if not dec_list:
+4. Принятые решения
+{decisions}
+
+5. Задачи и поручения (Action Items)
+№ | Задача | Ответственный | Срок | Критерий готовности / результат
+{action_items_table}
+
+6. Риски и блокеры
+{risks}
+
+7. Открытые вопросы
+{open_questions}
+
+8. Следующая встреча
+
+Дата/время: {next_datetime}
+Предварительная тема: {next_topic}
+""".strip()
+
+
+def build_protocol_plain_text(protocol: Dict[str, Any]) -> str:
+    participants = protocol.get("participants") or ["не указано"]
+    participants_block = "\n".join(participants)
+
+    agenda = protocol.get("agenda") or []
+    agenda_block = "\n".join(agenda) if agenda else "не указано"
+
+    key_points = protocol.get("key_points") or []
+    key_points_block = "\n".join(key_points) if key_points else "не указано"
+
+    decisions = protocol.get("decisions") or []
+    if not decisions:
         decisions_block = "Решения по итогам встречи не зафиксированы."
     else:
         parts = []
-        for d in dec_list:
+        for d in decisions:
             decision = normalize_space(d.get("decision", "")) or "не указано"
             context = normalize_space(d.get("context", "")) or "не указано"
             parts.append(f"Решение: {decision}\nОснование/контекст: {context}")
         decisions_block = "\n\n".join(parts)
 
-    # 5) Action items table
-    ai_list = merged.get("action_items") or []
-    if not ai_list:
+    action_items = protocol.get("action_items") or []
+    if not action_items:
         action_table = "— | Задачи не зафиксированы | — | — | —"
     else:
         rows = []
-        for i, a in enumerate(ai_list, start=1):
+        for i, a in enumerate(action_items, start=1):
             task = normalize_space(a.get("task", "")) or "не указано"
             owner = normalize_space(a.get("owner", "")) or "не указан"
             due = normalize_space(a.get("due", "")) or "не указан"
@@ -701,35 +520,27 @@ def build_protocol_text(
             rows.append(f"{i} | {task} | {owner} | {due} | {done}")
         action_table = "\n".join(rows)
 
-    # 6) Risks
-    risks_list = merged.get("risks") or []
-    if not risks_list:
+    risks = protocol.get("risks") or []
+    if not risks:
         risks_block = "Риски и блокеры не зафиксированы."
     else:
-        lines = []
-        for r in risks_list:
-            risk = normalize_space(r.get("risk", "")) or "не указано"
-            mit = normalize_space(r.get("mitigation", "")) or "не указано"
-            lines.append(f"{risk} — {mit}")
-        risks_block = "\n".join(lines)
+        risks_block = "\n".join([f"{normalize_space(r.get('risk',''))} — {normalize_space(r.get('mitigation',''))}" for r in risks])
 
-    # 7) Open questions
-    oq_list = merged.get("open_questions") or []
-    if not oq_list:
+    open_questions = protocol.get("open_questions") or []
+    if not open_questions:
         open_questions_block = "Открытые вопросы не зафиксированы."
     else:
-        open_questions_block = "\n".join(oq_list)
+        open_questions_block = "\n".join(open_questions)
 
-    # 8) Next meeting
-    nm = merged.get("next_meeting") or {}
+    nm = protocol.get("next_meeting") or {}
     next_dt = normalize_space(nm.get("datetime", "")) or "не указано"
     next_tp = normalize_space(nm.get("topic", "")) or "не указано"
 
-    return PROTOCOL_TEMPLATE.format(
-        date=date,
-        time=time_s,
-        format=fmt,
-        topic=topic_s,
+    return PROTOCOL_TEXT_TEMPLATE.format(
+        date=protocol.get("date", "не указано"),
+        time=protocol.get("time", "не указано"),
+        format=protocol.get("format", "не указано"),
+        topic=protocol.get("topic", "не указано"),
         participants=participants_block,
         agenda=agenda_block,
         key_points=key_points_block,
@@ -747,10 +558,9 @@ def generate_protocol_map_reduce(
     *,
     participants: List[str],
     topic: Optional[str],
-) -> Tuple[str, Dict[str, Any]]:
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
-    Returns: (protocol_text, debug_payload)
-    debug_payload can be optionally saved for inspection.
+    Returns: (protocol_data, debug_payload)
     """
     if OpenAI is None:
         raise RuntimeError("Package 'openai' is not installed. Install: pip install openai")
@@ -759,13 +569,12 @@ def generate_protocol_map_reduce(
 
     model = os.getenv("PROTOCOL_MODEL", "gpt-4.1")
 
-    # Conservative estimation & pacing settings
-    chars_per_token = float(os.getenv("EST_CHARS_PER_TOKEN", "3.0"))  # smaller => safer
-    tpm_limit = int(os.getenv("OPENAI_TPM_LIMIT", "30000"))           # your org limit from error
+    chars_per_token = float(os.getenv("EST_CHARS_PER_TOKEN", "3.0"))
+    tpm_limit = int(os.getenv("OPENAI_TPM_LIMIT", "30000"))
     limiter = TokenRateLimiter(tpm_limit)
 
-    chunk_tokens = int(os.getenv("PROTOCOL_CHUNK_TOKENS", "9000"))    # input tokens estimate per chunk
-    extract_out_tokens = int(os.getenv("PROTOCOL_EXTRACT_OUT_TOKENS", "900"))
+    chunk_tokens = int(os.getenv("PROTOCOL_CHUNK_TOKENS", "6500"))
+    extract_out_tokens = int(os.getenv("PROTOCOL_EXTRACT_OUT_TOKENS", "1400"))
     temperature = float(os.getenv("PROTOCOL_EXTRACT_TEMPERATURE", "0.0"))
 
     client = OpenAI()
@@ -775,29 +584,41 @@ def generate_protocol_map_reduce(
         raise RuntimeError("Transcript is empty after preprocessing.")
 
     chunks = chunk_by_lines(clean, max_input_tokens_est=chunk_tokens, chars_per_token=chars_per_token)
-    extracts: List[Dict[str, Any]] = []
 
+    extracts: List[Dict[str, Any]] = []
     for idx, ch in enumerate(chunks, start=1):
-        # Add light header to help chunk ordering, minimal extra tokens
         input_text = f"ЧАСТЬ {idx}/{len(chunks)}\n{ch}"
 
-        out = openai_call_with_backoff(
+        out_text = openai_call_with_backoff(
             client,
             model=model,
             instructions=EXTRACT_INSTRUCTIONS,
             input_text=input_text,
             max_output_tokens=extract_out_tokens,
             temperature=temperature,
-            store=False,
             limiter=limiter,
             chars_per_token=chars_per_token,
         )
 
-        payload = parse_json_robust(out)
+        payload = parse_json_robust(out_text)
         extracts.append(normalize_extract_payload(payload))
 
     merged = merge_extracts(extracts)
-    protocol_text = build_protocol_text(merged, participants=participants, topic=topic)
+
+    protocol_data: Dict[str, Any] = {
+        "date": "не указано",
+        "time": "не указано",
+        "format": "не указано",
+        "topic": normalize_space(topic) if topic else "не указано",
+        "participants": participants or ["не указано"],
+        "agenda": merged.get("agenda") or [],
+        "key_points": merged.get("key_points") or [],
+        "decisions": merged.get("decisions") or [],
+        "action_items": merged.get("action_items") or [],
+        "risks": merged.get("risks") or [],
+        "open_questions": merged.get("open_questions") or [],
+        "next_meeting": merged.get("next_meeting") or {"datetime": "не указано", "topic": "не указано"},
+    }
 
     debug = {
         "chunks": len(chunks),
@@ -809,8 +630,166 @@ def generate_protocol_map_reduce(
         "tpm_limit": tpm_limit,
         "chunk_tokens_est": chunk_tokens,
         "chars_per_token": chars_per_token,
+        "extract_out_tokens": extract_out_tokens,
     }
-    return protocol_text, debug
+    return protocol_data, debug
+
+
+# ---------------- ASR utilities ----------------
+def ext_from_url(url: str) -> str:
+    try:
+        path = urlparse(url).path
+        if "." in path:
+            ext = path.rsplit(".", 1)[-1].lower()
+            if 1 <= len(ext) <= 6:
+                return ext
+    except Exception:
+        pass
+    return "m4a"
+
+
+def is_http_url(url: str) -> bool:
+    try:
+        u = urlparse(url)
+        return u.scheme in ("http", "https") and bool(u.netloc)
+    except Exception:
+        return False
+
+
+async def download_by_url(url: str, dest: Path, max_bytes: int) -> int:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+
+    timeout = httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=30.0)
+    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
+        async with client.stream("GET", url) as r:
+            r.raise_for_status()
+            total = int(r.headers.get("Content-Length") or 0)
+            if total and total > max_bytes:
+                raise RuntimeError(f"File too large by Content-Length: {total/1024/1024:.1f} MB")
+
+            downloaded = 0
+            with open(tmp, "wb") as f:
+                async for chunk in r.aiter_bytes(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    downloaded += len(chunk)
+                    if downloaded > max_bytes:
+                        raise RuntimeError("File too large while downloading (limit exceeded).")
+                    f.write(chunk)
+
+    tmp.replace(dest)
+    return downloaded
+
+
+async def run_asr(local_audio_path: Path, lang: str, out_dir: Path) -> subprocess.CompletedProcess:
+    if not RUN_SCRIPT.exists():
+        raise RuntimeError(f"run script not found: {RUN_SCRIPT}")
+
+    cmd = [str(RUN_SCRIPT), str(local_audio_path), lang, str(out_dir)]
+    logger.info("Running ASR: %s", " ".join(cmd))
+
+    return await asyncio.to_thread(
+        subprocess.run,
+        cmd,
+        cwd=str(BASE_DIR),
+        capture_output=True,
+        text=True,
+    )
+
+
+def read_json(path: Path) -> Optional[Dict[str, Any]]:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def format_ts(seconds: float) -> str:
+    ms = int(round(float(seconds) * 1000))
+    s, ms = divmod(ms, 1000)
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+
+
+def render_segments_to_text(segments: List[Dict[str, Any]]) -> str:
+    lines: List[str] = []
+    for s in segments:
+        try:
+            lines.append(
+                f"[{format_ts(s['start'])} --> {format_ts(s['end'])}] {s['speaker']}: {s.get('text','')}"
+            )
+        except Exception:
+            continue
+    return "\n".join(lines)
+
+
+async def post_unknown_prompt(msg, job_id: str, job_dir: Path) -> None:
+    payload = read_json(job_dir / "result.json")
+    if not payload:
+        return
+
+    unknowns = payload.get("unknown_speakers") or []
+    if not unknowns:
+        return
+
+    lines = ["Обнаружены неизвестные говорящие:"]
+    for u in unknowns:
+        unk_id = u.get("id")
+        label = u.get("label")
+        if unk_id and label:
+            lines.append(f"- {unk_id} = {label}")
+
+    lines.append("")
+    lines.append("Чтобы назвать и запомнить голос, отправьте команду:")
+    lines.append(f"/label {job_id} UNKNOWN_1 Иван")
+    lines.append("(подставьте ваш UNKNOWN_k и имя)")
+
+    await msg.reply_text("\n".join(lines))
+
+
+def extract_participants(job_dir: Path) -> List[str]:
+    payload = read_json(job_dir / "result.json")
+    if not payload:
+        return []
+
+    participants: List[str] = []
+    for seg in (payload.get("segments") or []):
+        sp = seg.get("speaker")
+        if sp and sp not in participants:
+            participants.append(sp)
+    return participants
+
+
+# ---------------- Telegram helpers ----------------
+async def reply_text_or_file(msg, text: str, *, file_path: Optional[Path] = None, caption: Optional[str] = None) -> None:
+    text = (text or "").strip()
+    if len(text) <= MAX_TELEGRAM_TEXT:
+        if caption:
+            await msg.reply_text(f"{caption}\n\n{text}" if text else caption)
+        else:
+            await msg.reply_text(text if text else "(пусто)")
+        return
+
+    if file_path and file_path.exists():
+        with file_path.open("rb") as f:
+            await msg.reply_document(document=InputFile(f, filename=file_path.name), caption=caption)
+        return
+
+    tmp = BASE_DIR / f"long_{uuid.uuid4().hex}.txt"
+    tmp.write_text(text, encoding="utf-8")
+    try:
+        with tmp.open("rb") as f:
+            await msg.reply_document(document=InputFile(f, filename=tmp.name), caption=caption)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
 
 
 # ---------------- Command handlers ----------------
@@ -821,15 +800,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await msg.reply_text(
         "ASR бот запущен.\n\n"
-        "Что умеет:\n"
+        "Возможности:\n"
         "• Принимает voice/audio/document (до ~20MB) или прямую ссылку (http/https).\n"
         "• Делает транскрипт + диаризацию.\n"
         "• Если есть UNKNOWN_* — можно подписать голоса командой /label.\n"
         "• /speakers — список известных голосов.\n"
-        "• /protocol <job_id> [тема] — протокол совещания (поддерживает длинные транскрипты).\n\n"
+        "• /protocol <job_id> [тема] — протокол совещания в Word (.docx).\n\n"
         "Примеры:\n"
         "/label <job_id> UNKNOWN_1 Иван\n"
-        "/protocol <job_id> Протокол встречи по проекту"
+        "/protocol <job_id> Тема встречи"
     )
 
 
@@ -852,9 +831,6 @@ async def cmd_speakers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def cmd_label(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /label <job_id> <UNKNOWN_1> <Имя Фамилия>
-    """
     msg = update.message
     if msg is None:
         return
@@ -894,13 +870,11 @@ async def cmd_label(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.reply_text(f"У {unknown_id} нет embedding (возможно, слишком мало речи для voiceprint).")
         return
 
-    # Save voiceprint atomically
     async with VOICE_DB_LOCK:
         db = load_db(VOICE_DB_PATH)
         add_voiceprint(db, name, emb)
         save_db(VOICE_DB_PATH, db)
 
-    # Update current job output for convenience (replace UNKNOWN_k -> name)
     segments = payload.get("segments") or []
     changed = 0
     for s in segments:
@@ -931,9 +905,6 @@ async def cmd_label(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_protocol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /protocol <job_id> [тема...]
-    """
     msg = update.message
     if msg is None:
         return
@@ -963,11 +934,11 @@ async def cmd_protocol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     participants = extract_participants(job_dir)
 
-    await msg.reply_text("Готовлю протокол (GPT)...")
+    await msg.reply_text("Готовлю протокол (Word)...")
 
     async with PROTOCOL_LOCK:
         try:
-            protocol_text, debug_payload = await asyncio.to_thread(
+            protocol_data, debug_payload = await asyncio.to_thread(
                 generate_protocol_map_reduce,
                 transcript,
                 participants=participants,
@@ -977,20 +948,30 @@ async def cmd_protocol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await msg.reply_text(f"Ошибка генерации протокола: {e}")
             return
 
-    protocol_path = job_dir / "protocol.txt"
-    protocol_path.write_text(protocol_text, encoding="utf-8")
+    # Save plain text for audit/debug (not sent)
+    protocol_txt_path = job_dir / "protocol.txt"
+    protocol_txt_path.write_text(build_protocol_plain_text(protocol_data), encoding="utf-8")
 
-    # Optional debug file (turn on via env)
+    # Build DOCX (send to user)
+    protocol_docx_path = job_dir / "protocol.docx"
+    try:
+        build_protocol_docx(protocol_data, protocol_docx_path)
+    except Exception as e:
+        await msg.reply_text(f"Ошибка формирования Word-файла: {e}")
+        return
+
     if env_bool("PROTOCOL_SAVE_DEBUG", default=False):
         debug_path = job_dir / "protocol_debug.json"
         debug_path.write_text(json.dumps(debug_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    await reply_text_or_file(
-        msg,
-        protocol_text,
-        file_path=protocol_path,
-        caption=f"ПРОТОКОЛ (job_id: {job_id})",
-    )
+    try:
+        with protocol_docx_path.open("rb") as f:
+            await msg.reply_document(
+                document=InputFile(f, filename=f"protocol_{job_id}.docx"),
+                caption=f"Протокол совещания (job_id: {job_id})",
+            )
+    except Exception as e:
+        await msg.reply_text(f"Ошибка отправки Word-файла в Telegram: {e}")
 
 
 # ---------------- Message handlers ----------------
@@ -1157,14 +1138,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 def main() -> None:
     app = ApplicationBuilder().token(TG_BOT_TOKEN).build()
 
-    # Commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("label", cmd_label))
     app.add_handler(CommandHandler("speakers", cmd_speakers))
     app.add_handler(CommandHandler("protocol", cmd_protocol))
 
-    # Messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.Document.ALL, handle_audio))
 
