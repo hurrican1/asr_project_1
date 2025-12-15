@@ -6,3 +6,6 @@ omegaconf>=2.3.0,<3.0.0
 # Telegram bot
 python-telegram-bot==21.6
 httpx~=0.27
+
+# --- GPT / Protocol ---
+openai>=1.30.0
