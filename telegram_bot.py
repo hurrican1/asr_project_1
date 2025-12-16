@@ -1,21 +1,60 @@
 from __future__ import annotations
 
 import logging
+import os
 
-from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, MessageHandler, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 import config
 from handlers import callbacks, commands, messages
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
+def _setup_logging() -> None:
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+
+    # IMPORTANT: prevent leaking bot token in logs
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("telegram").setLevel(logging.WARNING)
+
+
 logger = logging.getLogger("asr-bot")
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Global error handler: logs full exception stack trace.
+    If BOT_DEBUG=1, sends short error message to the chat.
+    """
+    logger.exception("Unhandled exception while processing update", exc_info=context.error)
+
+    if os.getenv("BOT_DEBUG", "0").strip().lower() in ("1", "true", "yes", "y", "on"):
+        try:
+            chat = getattr(update, "effective_chat", None)
+            if chat is not None:
+                await context.bot.send_message(
+                    chat_id=chat.id,
+                    text=f"DEBUG: ошибка в обработчике: {type(context.error).__name__}: {context.error}",
+                )
+        except Exception:
+            pass
+
+
 def main() -> None:
+    _setup_logging()
+
     token = config.require_tg_bot_token()
     app = ApplicationBuilder().token(token).build()
 
@@ -37,6 +76,9 @@ def main() -> None:
 
     # Audio / documents
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.Document.ALL, messages.handle_audio))
+
+    # Global error handler
+    app.add_error_handler(error_handler)
 
     logger.info("Telegram ASR bot started (polling).")
     app.run_polling()

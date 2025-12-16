@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 from typing import Optional
 
@@ -10,6 +11,9 @@ import ui
 from handlers.common import send_document
 from services import export_service, protocol_service, voice_service
 from services.docx_service import build_protocol_docx
+
+
+logger = logging.getLogger("asr-bot")
 
 
 def get_job_dir(job_id: str) -> Path:
@@ -29,6 +33,7 @@ async def send_job_zip(msg, job_id: str) -> None:
     try:
         zip_path = export_service.create_job_zip(job_id)
     except Exception as e:
+        logger.exception("create_job_zip failed: job_id=%s", job_id)
         await msg.reply_text(f"Не удалось собрать архив: {e}")
         return
 
@@ -41,19 +46,38 @@ async def send_job_zip(msg, job_id: str) -> None:
 
 
 async def _try_edit_message(message, *, text: str, reply_markup=None) -> None:
+    """
+    Robust edit:
+    - try to edit the existing status message
+    - if it fails, log error and send a NEW message with the same text/buttons
+    """
     try:
         if message is not None:
             await message.edit_text(text, reply_markup=reply_markup)
-    except Exception:
-        pass
+            return
+    except Exception as e:
+        logger.exception("Failed to edit status message: %s", e)
+
+        if config.env_bool("BOT_DEBUG", False):
+            try:
+                await message.reply_text(f"DEBUG: edit_text failed: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+
+    # fallback: send a new message if editing failed
+    try:
+        if message is not None:
+            await message.reply_text(text, reply_markup=reply_markup)
+    except Exception as e2:
+        logger.exception("Fallback reply_text also failed: %s", e2)
 
 
 async def _try_delete_message(message) -> None:
     try:
         if message is not None:
             await message.delete()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.exception("Failed to delete message: %s", e)
 
 
 async def send_post_asr_choice(
@@ -80,12 +104,14 @@ async def send_post_asr_choice(
         short = ", ".join(ids[:6])
         more = f" +{len(ids)-6}" if len(ids) > 6 else ""
         lines.append(f"Найдены неизвестные спикеры: {len(ids)} ({short}{more})")
-        lines.append("Выберите: получить протокол сразу или сначала подписать UNKNOWN (и получить финальный Word).")
+        lines.append("Выберите: получить протокол сейчас или сначала подписать UNKNOWN (и получить финальный Word).")
     else:
         lines.append("UNKNOWN-спикеры не найдены.")
         lines.append("Нажмите «Протокол (Word) сейчас», чтобы получить документ.")
 
     text = "\n".join(lines)
+
+    logger.info("Post-ASR choice: job_id=%s has_unknown=%s", job_id, has_unknown)
 
     if status_msg is not None:
         await _try_edit_message(status_msg, text=text, reply_markup=kb)
@@ -118,6 +144,8 @@ async def generate_and_send_protocol(
     unknown_count = len(unknowns)
     keyboard = ui.job_keyboard(job_id, has_unknown=unknown_count > 0)
 
+    logger.info("Protocol generation started: job_id=%s unknown_count=%s", job_id, unknown_count)
+
     if status_msg is not None:
         await _try_edit_message(status_msg, text=ui.STAGE2_TEXT, reply_markup=None)
     elif announce:
@@ -132,6 +160,7 @@ async def generate_and_send_protocol(
                 topic=topic,
             )
     except Exception as e:
+        logger.exception("Protocol generation failed: job_id=%s", job_id)
         if status_msg is not None:
             await _try_edit_message(status_msg, text=f"Ошибка формирования протокола: {e}", reply_markup=None)
         await msg.reply_text(
@@ -145,6 +174,7 @@ async def generate_and_send_protocol(
     try:
         build_protocol_docx(protocol_data, protocol_docx)
     except Exception as e:
+        logger.exception("Word build failed: job_id=%s", job_id)
         if status_msg is not None:
             await _try_edit_message(status_msg, text=f"Ошибка формирования Word: {e}", reply_markup=None)
         await msg.reply_text(f"Ошибка формирования Word-файла: {e}")

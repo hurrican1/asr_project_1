@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import config
@@ -7,6 +8,9 @@ import ui
 from handlers import flows
 from services import asr_service, download_service, voice_service
 from state import clear_pending_label, get_pending_label, is_pending_expired, set_pending_label
+
+
+logger = logging.getLogger("asr-bot")
 
 
 def _normalize_name(text: str) -> str:
@@ -67,9 +71,12 @@ async def handle_menu_text(update, context) -> None:
             return
 
         try:
+            logger.info("Labeling: job_id=%s unknown=%s name=%s", job_id, unknown_id, name)
             changed, remaining = await voice_service.apply_label_to_job(job_id, unknown_id, name)
+            logger.info("Labeling done: changed=%s remaining_unknown=%s", changed, remaining)
         except Exception as e:
-            await msg.reply_text(f"Ошибка: {e}", reply_markup=ui.start_keyboard())
+            logger.exception("apply_label_to_job failed")
+            await msg.reply_text(f"Ошибка подписи UNKNOWN: {e}", reply_markup=ui.start_keyboard())
             return
 
         # Continue bulk flow
@@ -96,14 +103,13 @@ async def handle_menu_text(update, context) -> None:
 
         # Finished labeling
         if auto_protocol_after:
-            # Restore normal keyboard + inform we are creating the protocol now
             await msg.reply_text(
                 f"Готово: {unknown_id} = {name}. Имена сохранены.\n"
                 f"Формирую финальный протокол в Word…",
                 reply_markup=ui.start_keyboard(),
             )
 
-            # Try to update the control (pre-protocol) message to stage2 (optional)
+            # Optional: update control message (if exists)
             if isinstance(control_chat_id, int) and isinstance(control_message_id, int):
                 try:
                     await context.bot.edit_message_text(
@@ -112,17 +118,22 @@ async def handle_menu_text(update, context) -> None:
                         text=ui.STAGE2_TEXT,
                     )
                 except Exception:
-                    pass
+                    logger.exception("Failed to edit control message (stage2)")
 
-            # Generate and send protocol WITHOUT extra stage message
-            await flows.generate_and_send_protocol(msg, job_id, announce=False)
+            try:
+                await flows.generate_and_send_protocol(msg, job_id, announce=False)
+            except Exception:
+                logger.exception("generate_and_send_protocol failed after labeling")
+                await msg.reply_text("Ошибка: не удалось собрать протокол после подписи UNKNOWN (см. логи).")
+                return
 
-            # Delete control message (keep chat clean) if possible
+            # Optional: delete control message to keep chat clean
             if isinstance(control_chat_id, int) and isinstance(control_message_id, int):
                 try:
                     await context.bot.delete_message(chat_id=control_chat_id, message_id=control_message_id)
                 except Exception:
-                    pass
+                    logger.exception("Failed to delete control message")
+
             return
 
         # Non-auto finalize: show actions
@@ -193,26 +204,33 @@ async def handle_url(update, context, url: str) -> None:
     ext = download_service.ext_from_url(url)
     local_path = config.AUDIO_INBOX / f"url_{job_id}.{ext}"
 
-    status_msg = await msg.reply_text(ui.STAGE1_TEXT, reply_markup=ui.start_keyboard())
+    # IMPORTANT FIX: status_msg WITHOUT reply keyboard (we will edit it later)
+    status_msg = await msg.reply_text(ui.STAGE1_TEXT)
+
+    logger.info("URL job started: job_id=%s url=%s dest=%s", job_id, url, local_path)
 
     try:
         await download_service.download_by_url(url, local_path, max_bytes=config.URL_MAX_DOWNLOAD_BYTES)
+        logger.info("URL download done: job_id=%s file=%s", job_id, local_path)
     except Exception as e:
+        logger.exception("download_by_url failed: job_id=%s", job_id)
         try:
             await status_msg.edit_text(f"Ошибка скачивания: {e}")
         except Exception:
-            pass
+            logger.exception("Failed to edit status message (download error)")
         await msg.reply_text(f"Ошибка скачивания по ссылке: {e}", reply_markup=ui.start_keyboard())
         return
 
     try:
         async with config.PROCESS_LOCK:
             proc = await asr_service.run_asr(local_path, lang=config.DEFAULT_LANG, job_dir=job_dir)
+        logger.info("ASR finished: job_id=%s returncode=%s", job_id, proc.returncode)
     except Exception as e:
+        logger.exception("run_asr failed: job_id=%s", job_id)
         try:
             await status_msg.edit_text(f"Ошибка ASR: {e}")
         except Exception:
-            pass
+            logger.exception("Failed to edit status message (ASR error)")
         await msg.reply_text(f"Ошибка запуска распознавания: {e}", reply_markup=ui.start_keyboard())
         return
     finally:
@@ -220,27 +238,38 @@ async def handle_url(update, context, url: str) -> None:
             try:
                 local_path.unlink()
             except Exception:
-                pass
+                logger.exception("Failed to delete input audio")
 
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or "no output")[-3500:]
+        logger.error("ASR non-zero: job_id=%s tail=%s", job_id, err)
         try:
             await status_msg.edit_text("Ошибка при обработке аудио (ASR).")
         except Exception:
-            pass
+            logger.exception("Failed to edit status message (ASR non-zero)")
         await msg.reply_text("Ошибка при обработке аудио. Лог ниже:", reply_markup=ui.start_keyboard())
         await msg.reply_text(err, reply_markup=ui.start_keyboard())
         return
 
+    # Decision: ask choice (AUTO_PROTOCOL_ALWAYS=0) or if unknown exists
     unknowns = voice_service.get_unknowns(job_dir)
+    logger.info("Unknowns detected: job_id=%s count=%s", job_id, len(unknowns))
 
-    # If unknowns exist -> ask user; else auto-protocol if enabled.
-    if unknowns or not config.AUTO_PROTOCOL_ALWAYS:
-        await flows.send_post_asr_choice(msg, job_id, status_msg=status_msg)
+    try:
+        if unknowns or not config.AUTO_PROTOCOL_ALWAYS:
+            await flows.send_post_asr_choice(msg, job_id, status_msg=status_msg)
+            return
+
+        # Auto protocol (no unknowns and AUTO_PROTOCOL_ALWAYS=1)
+        await flows.generate_and_send_protocol(msg, job_id, announce=False, status_msg=status_msg, delete_status=True)
+    except Exception as e:
+        logger.exception("Post-ASR action failed: job_id=%s", job_id)
+        try:
+            await status_msg.edit_text(f"Ошибка после ASR: {type(e).__name__}: {e}")
+        except Exception:
+            logger.exception("Failed to edit status message (post-ASR error)")
+        await msg.reply_text(f"Внутренняя ошибка после ASR: {e}", reply_markup=ui.start_keyboard())
         return
-
-    # Auto protocol (no unknowns)
-    await flows.generate_and_send_protocol(msg, job_id, announce=False, status_msg=status_msg, delete_status=True)
 
 
 async def handle_audio(update, context) -> None:
@@ -288,28 +317,36 @@ async def handle_audio(update, context) -> None:
         return
 
     job_id, job_dir = asr_service.create_job()
-    status_msg = await msg.reply_text(ui.STAGE1_TEXT, reply_markup=ui.start_keyboard())
+
+    # IMPORTANT FIX: status_msg WITHOUT reply keyboard
+    status_msg = await msg.reply_text(ui.STAGE1_TEXT)
+
+    logger.info("Audio job started: job_id=%s ext=%s", job_id, ext)
 
     try:
         tg_file = await context.bot.get_file(tg_obj.file_id)
         local_path = config.AUDIO_INBOX / f"{tg_obj.file_id}_{job_id}{ext}"
         await tg_file.download_to_drive(custom_path=str(local_path))
+        logger.info("Telegram download done: job_id=%s file=%s", job_id, local_path)
     except Exception as e:
+        logger.exception("Telegram download failed: job_id=%s", job_id)
         try:
             await status_msg.edit_text(f"Ошибка скачивания из Telegram: {e}")
         except Exception:
-            pass
+            logger.exception("Failed to edit status message (TG download error)")
         await msg.reply_text(f"Ошибка скачивания из Telegram: {e}", reply_markup=ui.start_keyboard())
         return
 
     try:
         async with config.PROCESS_LOCK:
             proc = await asr_service.run_asr(local_path, lang=config.DEFAULT_LANG, job_dir=job_dir)
+        logger.info("ASR finished: job_id=%s returncode=%s", job_id, proc.returncode)
     except Exception as e:
+        logger.exception("run_asr failed: job_id=%s", job_id)
         try:
             await status_msg.edit_text(f"Ошибка ASR: {e}")
         except Exception:
-            pass
+            logger.exception("Failed to edit status message (ASR error)")
         await msg.reply_text(f"Ошибка запуска распознавания: {e}", reply_markup=ui.start_keyboard())
         return
     finally:
@@ -317,24 +354,33 @@ async def handle_audio(update, context) -> None:
             try:
                 local_path.unlink()
             except Exception:
-                pass
+                logger.exception("Failed to delete input audio")
 
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or "no output")[-3500:]
+        logger.error("ASR non-zero: job_id=%s tail=%s", job_id, err)
         try:
             await status_msg.edit_text("Ошибка при обработке аудио (ASR).")
         except Exception:
-            pass
+            logger.exception("Failed to edit status message (ASR non-zero)")
         await msg.reply_text("Ошибка при обработке аудио. Лог ниже:", reply_markup=ui.start_keyboard())
         await msg.reply_text(err, reply_markup=ui.start_keyboard())
         return
 
     unknowns = voice_service.get_unknowns(job_dir)
+    logger.info("Unknowns detected: job_id=%s count=%s", job_id, len(unknowns))
 
-    # If unknowns exist -> ask user; else auto-protocol if enabled.
-    if unknowns or not config.AUTO_PROTOCOL_ALWAYS:
-        await flows.send_post_asr_choice(msg, job_id, status_msg=status_msg)
+    try:
+        if unknowns or not config.AUTO_PROTOCOL_ALWAYS:
+            await flows.send_post_asr_choice(msg, job_id, status_msg=status_msg)
+            return
+
+        await flows.generate_and_send_protocol(msg, job_id, announce=False, status_msg=status_msg, delete_status=True)
+    except Exception as e:
+        logger.exception("Post-ASR action failed: job_id=%s", job_id)
+        try:
+            await status_msg.edit_text(f"Ошибка после ASR: {type(e).__name__}: {e}")
+        except Exception:
+            logger.exception("Failed to edit status message (post-ASR error)")
+        await msg.reply_text(f"Внутренняя ошибка после ASR: {e}", reply_markup=ui.start_keyboard())
         return
-
-    # Auto protocol (no unknowns)
-    await flows.generate_and_send_protocol(msg, job_id, announce=False, status_msg=status_msg, delete_status=True)
