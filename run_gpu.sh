@@ -1,39 +1,105 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$BASE_DIR"
+# =========================
+# run_gpu.sh
+# =========================
+# Назначение:
+# - стабилизировать CUDA/cuDNN
+# - зафиксировать кеши (HF / torch / whisper)
+# - запустить run_asr.py с корректным окружением
+#
+# Аргументы:
+#   $1 = путь к аудио
+#   $2 = язык (например ru)
+#   $3 = output_dir (jobs/<job_id>)
+# =========================
 
-# Activate venv if exists
-if [[ -f "$BASE_DIR/.venv/bin/activate" ]]; then
-  # shellcheck disable=SC1091
-  source "$BASE_DIR/.venv/bin/activate"
+if [ "$#" -lt 3 ]; then
+  echo "Usage: $0 <audio_path> <language> <output_dir>"
+  exit 1
 fi
 
-AUDIO_PATH="${1:-}"
-LANG="${2:-ru}"
-OUT_DIR="${3:-.}"
+AUDIO_PATH="$1"
+LANG="$2"
+OUT_DIR="$3"
 
-if [[ -z "$AUDIO_PATH" ]]; then
-  echo "Usage: $0 <audio_path> [lang] [out_dir]"
+echo "=== run_gpu.sh ==="
+echo "Audio:    $AUDIO_PATH"
+echo "Language: $LANG"
+echo "Out dir:  $OUT_DIR"
+
+# -------------------------
+# 1) Python environment
+# -------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+if [ ! -d ".venv" ]; then
+  echo "ERROR: .venv not found. Activate/create venv first."
   exit 2
 fi
 
-# Build LD_LIBRARY_PATH from NVIDIA libs that come with PyTorch wheels
-NVIDIA_LIBS=$(python - <<'PY'
-import site, glob, os
-paths=[]
-for base in site.getsitepackages():
-    n=os.path.join(base, "nvidia")
-    if os.path.isdir(n):
-        for lib in glob.glob(os.path.join(n, "*", "lib")):
-            paths.append(lib)
-print(":".join(paths))
-PY
+source .venv/bin/activate
+
+# -------------------------
+# 2) CUDA / cuDNN fix
+# -------------------------
+# Собираем все libnvidia/cuDNN из site-packages,
+# чтобы не ловить CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH
+NVIDIA_LIBS=$(python - << 'EOF'
+import site, os
+paths = []
+for p in site.getsitepackages():
+    cand = os.path.join(p, "nvidia")
+    if os.path.isdir(cand):
+        for root, dirs, files in os.walk(cand):
+            if any(f.startswith("libcudnn") or f.startswith("libcuda") for f in files):
+                paths.append(root)
+print(":".join(sorted(set(paths))))
+EOF
 )
 
-if [[ -n "$NVIDIA_LIBS" ]]; then
-  export LD_LIBRARY_PATH="$NVIDIA_LIBS"
+if [ -n "$NVIDIA_LIBS" ]; then
+  export LD_LIBRARY_PATH="$NVIDIA_LIBS:${LD_LIBRARY_PATH:-}"
 fi
 
-python run_asr.py --audio_path "$AUDIO_PATH" --language "$LANG" --out_dir "$OUT_DIR"
+echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+
+# -------------------------
+# 3) Stable cache locations
+# -------------------------
+# ВАЖНО: persistent volume (/workspace)
+export XDG_CACHE_HOME="/workspace/.cache"
+export HF_HOME="/workspace/.cache/huggingface"
+export TORCH_HOME="/workspace/.cache/torch"
+export TRANSFORMERS_CACHE="/workspace/.cache/huggingface"
+export WHISPERX_CACHE_DIR="/workspace/.cache/whisperx"
+
+mkdir -p "$XDG_CACHE_HOME" "$HF_HOME" "$TORCH_HOME" "$WHISPERX_CACHE_DIR"
+
+echo "Cache dirs:"
+echo "  XDG_CACHE_HOME=$XDG_CACHE_HOME"
+echo "  HF_HOME=$HF_HOME"
+echo "  TORCH_HOME=$TORCH_HOME"
+
+# -------------------------
+# 4) Diagnostics (temporary)
+# -------------------------
+echo "Python: $(which python)"
+python --version
+
+echo "Env summary:"
+echo "  WHISPERX_VAD_METHOD=${WHISPERX_VAD_METHOD:-unset}"
+echo "  HF_TOKEN=${HF_TOKEN:+set}"
+echo "  CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-all}"
+
+# -------------------------
+# 5) Run ASR
+# -------------------------
+echo "Starting ASR..."
+python run_asr.py "$AUDIO_PATH" "$LANG" "$OUT_DIR"
+
+RC=$?
+echo "ASR finished with code $RC"
+exit $RC

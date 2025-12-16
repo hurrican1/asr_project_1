@@ -1,684 +1,685 @@
 #!/usr/bin/env python3
-# === Required by user: PyTorch 2.6+ safe unpickling fix (must be at top) ===
-import torch
+"""
+run_asr.py — WhisperX + alignment + pyannote diarization + speaker embedding export
 
-torch.serialization.add_safe_globals(
-    [
-        __import__("omegaconf").OmegaConf,
-        __import__("omegaconf.listconfig").listconfig.ListConfig,
-    ]
-)
+Основная цель этого файла:
+1) Принять аудиофайл (путь) + язык (опционально) + output_dir (опционально)
+2) Привести аудио к 16kHz mono WAV (через ffmpeg)
+3) Запустить WhisperX ASR + alignment
+4) Запустить diarization (pyannote) и назначить спикеров сегментам
+5) Попробовать распознать известных спикеров по voice_db.json (косинусная близость embeddings)
+6) Остальных обозначить как UNKNOWN_1, UNKNOWN_2, ... и сохранить их embeddings в result.json
+7) Сохранить result.json и result.txt в output_dir
 
-import os
-import sys
-import json
+Заметка по VAD:
+По умолчанию используется pyannote VAD (WHISPERX_VAD_METHOD=pyannote),
+чтобы избежать torch.hub загрузки silero-vad из GitHub.
+"""
+
+from __future__ import annotations
+
 import argparse
-import shutil
+import json
+import logging
+import os
 import subprocess
-import tempfile
-import uuid
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from collections import defaultdict
 
 import numpy as np
 
-# --- RunPod / HF download robustness ---
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
-os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
 
-VOICE_EMBED_MODEL_ID = "pyannote/wespeaker-voxceleb-resnet34-LM"
+LOG = logging.getLogger("run_asr")
 
 
-# --------------------------- utils ---------------------------
-def print_environment() -> None:
-    print("=== Environment info ===")
-    print(f"Python version : {sys.version.split()[0]}")
-    print(f"Torch version : {torch.__version__}")
-    cuda_ver = getattr(torch.version, "cuda", None)
-    print(f"Torch CUDA : {cuda_ver if cuda_ver else 'not available'}")
-    cudnn_ver = None
+def env_str(name: str, default: Optional[str] = None) -> Optional[str]:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    v = v.strip()
+    return v if v else default
+
+
+def env_int(name: str, default: int) -> int:
+    v = env_str(name)
+    if v is None:
+        return default
     try:
-        cudnn_ver = torch.backends.cudnn.version()
+        return int(v)
     except Exception:
-        cudnn_ver = None
-    print(f"cuDNN version : {cudnn_ver if cudnn_ver else 'unknown'}")
-
-    if torch.cuda.is_available():
-        n = torch.cuda.device_count()
-        print(f"CUDA available : YES ({n} GPU(s) detected)")
-        for i in range(n):
-            print(f" GPU {i}: {torch.cuda.get_device_name(i)}")
-    else:
-        print("CUDA available : NO (running on CPU)")
+        return default
 
 
-def choose_device(requested: Optional[str]) -> str:
-    if requested:
-        dev = requested.strip().lower()
-    else:
-        dev = "cuda" if torch.cuda.is_available() else "cpu"
-
-    if dev.startswith("cuda") and not torch.cuda.is_available():
-        print("WARNING: CUDA requested but not available. Falling back to CPU.")
-        dev = "cpu"
-
-    print(f"Using device : {dev}")
-    return dev
+def env_float(name: str, default: float) -> float:
+    v = env_str(name)
+    if v is None:
+        return default
+    try:
+        return float(v)
+    except Exception:
+        return default
 
 
-def require_ffmpeg() -> None:
-    if shutil.which("ffmpeg") is None:
-        print("ERROR: ffmpeg not found in PATH.")
-        print("Install it:")
-        print(" Ubuntu/Debian: sudo apt update && sudo apt install -y ffmpeg")
-        print(" macOS: brew install ffmpeg")
-        sys.exit(1)
+def format_time(seconds: float) -> str:
+    if seconds is None:
+        return "00:00"
+    s = max(0.0, float(seconds))
+    mm = int(s // 60)
+    ss = int(s % 60)
+    return f"{mm:02d}:{ss:02d}"
 
 
-def convert_to_wav_16k_mono(input_path: str) -> Tuple[str, bool]:
-    """
-    Convert any input audio into a temporary 16kHz mono WAV file.
-    This makes pyannote pipelines stable (they expect 16k mono) and avoids codec issues.
-    Returns: (wav_path, is_temporary)
-    """
-    require_ffmpeg()
-    tmp_wav = os.path.join(tempfile.gettempdir(), f"asr_tmp_{uuid.uuid4().hex}.wav")
+def ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def run_ffmpeg_to_wav16k_mono(src: Path, dst_wav: Path) -> None:
+    """Convert any input audio/video to 16kHz mono WAV."""
+    ensure_dir(dst_wav.parent)
     cmd = [
         "ffmpeg",
         "-y",
-        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
         "-i",
-        input_path,
+        str(src),
         "-ac",
         "1",
         "-ar",
         "16000",
         "-vn",
-        tmp_wav,
+        str(dst_wav),
     ]
-    try:
-        subprocess.run(cmd, check=True, capture_output=True)
-    except subprocess.CalledProcessError as e:
-        err = e.stderr.decode(errors="ignore") if e.stderr else str(e)
-        print("ERROR: ffmpeg conversion failed.")
-        print(err)
-        sys.exit(1)
-    return tmp_wav, True
+    LOG.info("ffmpeg: %s", " ".join(cmd))
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if p.returncode != 0:
+        tail = (p.stderr or p.stdout or "")[-2000:]
+        raise RuntimeError(f"ffmpeg failed (rc={p.returncode}). Tail:\n{tail}")
 
 
-def load_dotenv_if_exists(env_path: str = ".env") -> None:
-    if os.getenv("HF_TOKEN"):
-        return
-    if not os.path.isfile(env_path):
-        return
-    try:
-        with open(env_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                k = k.strip()
-                v = v.strip().strip('"').strip("'")
-                if k == "HF_TOKEN" and v:
-                    os.environ["HF_TOKEN"] = v
-                    return
-    except Exception:
-        return
-
-
-def get_hf_token(skip_diarization: bool) -> Optional[str]:
-    load_dotenv_if_exists(".env")
-    token = os.getenv("HF_TOKEN")
-    if token:
-        print("HF_TOKEN : detected (not printed for security)")
-        return token
-
-    msg = (
-        "HF_TOKEN environment variable is not set.\n"
-        "It is required to download pyannote speaker-diarization models from Hugging Face.\n"
-        "Create a token at https://huggingface.co/settings/tokens with 'read' access,\n"
-        "accept terms for pyannote models, then set it:\n"
-        " export HF_TOKEN=hf_xxx\n"
-        "Or create a local .env file (NOT committed) with:\n"
-        " HF_TOKEN=hf_xxx\n"
-    )
-    if skip_diarization:
-        print("WARNING: " + msg)
-        print("Proceeding without diarization because --skip_diarization was provided.")
-        return None
-
-    print("ERROR: " + msg)
-    sys.exit(1)
-
-
-def format_ts(seconds: float) -> str:
-    ms = int(round(float(seconds) * 1000))
-    s, ms = divmod(ms, 1000)
-    m, s = divmod(s, 60)
-    h, m = divmod(m, 60)
-    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
-
-
-# --------------------------- diarization helpers ---------------------------
-def create_pyannote_pipeline(hf_token: str, requested_device: str):
+def load_voice_db(db_path: Path) -> Dict[str, Any]:
     """
-    Loads pyannote speaker diarization pipeline and tries to move it to GPU.
-    If GPU move fails, it will force CPU to avoid mixed-device crashes.
-    """
-    from pyannote.audio import Pipeline
-
-    print("Loading pyannote speaker-diarization-3.1 pipeline ...")
-    try:
-        try:
-            pipeline = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization-3.1",
-                use_auth_token=hf_token,
-            )
-        except TypeError:
-            pipeline = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization-3.1",
-                token=hf_token,
-            )
-    except Exception as e:
-        print("ERROR: Failed to load pyannote pipeline.")
-        print("Make sure token is valid and model terms are accepted on Hugging Face.")
-        print(f"Original error: {e}")
-        sys.exit(1)
-
-    # Always start on CPU (clean baseline)
-    pipeline.to(torch.device("cpu"))
-
-    # Try GPU if requested and available
-    if requested_device.startswith("cuda") and torch.cuda.is_available():
-        try:
-            pipeline.to(torch.device(requested_device))
-            print(f"pyannote device : {requested_device}")
-        except Exception as e:
-            print(f"WARNING: could not move pyannote pipeline to '{requested_device}'. Falling back to CPU.")
-            print(f" Reason: {e}")
-            pipeline.to(torch.device("cpu"))
-            print("pyannote device : cpu")
-    else:
-        print("pyannote device : cpu")
-
-    return pipeline
-
-
-def diarize_with_retry(pipeline, wav_path: str):
-    """
-    Run diarization. If a mixed-device runtime error happens, force CPU and retry once.
-    """
-    try:
-        return pipeline(wav_path)
-    except RuntimeError as e:
-        msg = str(e)
-        if "Expected all tensors to be on the same device" in msg:
-            print("WARNING: pyannote device mismatch detected. Forcing CPU diarization and retrying once ...")
-            try:
-                pipeline.to(torch.device("cpu"))
-            except Exception:
-                pass
-            return pipeline(wav_path)
-        raise
-
-
-def assign_word_speakers(diarization, aligned: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Assign speaker label to each word by matching word mid-time with diarization segments.
-    Returns a flat list of words {word,start,end,speaker}.
-    """
-    diar = []
-    for turn, _, speaker in diarization.itertracks(yield_label=True):
-        diar.append((float(turn.start), float(turn.end), str(speaker)))
-    diar.sort(key=lambda x: x[0])
-
-    def speaker_at(t: float) -> str:
-        for s, e, spk in diar:
-            if s <= t < e:
-                return spk
-        return "SPEAKER_UNKNOWN"
-
-    words: List[Dict[str, Any]] = []
-    for seg in aligned.get("segments", []) or []:
-        for w in (seg.get("words") or []):
-            if "start" not in w or "end" not in w:
-                continue
-            word_text = (w.get("word") or "").strip()
-            if not word_text:
-                continue
-            start = float(w["start"])
-            end = float(w["end"])
-            mid = 0.5 * (start + end)
-            words.append(
-                {"word": word_text, "start": start, "end": end, "speaker": speaker_at(mid)}
-            )
-
-    words.sort(key=lambda x: x["start"])
-    return words
-
-
-def merge_words_into_speaker_segments(
-    words: List[Dict[str, Any]], max_gap: float = 1.0
-) -> List[Dict[str, Any]]:
-    """
-    Merge consecutive words into speaker segments.
-    """
-    if not words:
-        return []
-
-    out: List[Dict[str, Any]] = []
-    cur = {
-        "speaker": words[0]["speaker"],
-        "start": words[0]["start"],
-        "end": words[0]["end"],
-        "words": [words[0]],
+    Expected schema (пример):
+    {
+      "version": 1,
+      "model_id": "pyannote/wespeaker-voxceleb-resnet34-LM",
+      "speakers": {
+        "Иван": {"embeddings": [[...],[...]], "meta": {...}},
+        ...
+      }
     }
-
-    for prev, w in zip(words, words[1:]):
-        gap = w["start"] - prev["end"]
-        if w["speaker"] != cur["speaker"] or gap > max_gap:
-            cur["end"] = prev["end"]
-            cur["text"] = " ".join(x["word"] for x in cur["words"]).strip()
-            out.append(cur)
-            cur = {"speaker": w["speaker"], "start": w["start"], "end": w["end"], "words": [w]}
-        else:
-            cur["words"].append(w)
-            cur["end"] = w["end"]
-
-    cur["text"] = " ".join(x["word"] for x in cur["words"]).strip()
-    out.append(cur)
-    return out
-
-
-# --------------------------- speaker identification ---------------------------
-def create_embedding_inference(hf_token: Optional[str], device: str):
     """
-    Uses pyannote/wespeaker-voxceleb-resnet34-LM (compatible with pyannote.audio 3.x).
-    """
-    from pyannote.audio import Model, Inference
+    if not db_path.exists():
+        return {"version": 1, "model_id": None, "speakers": {}}
+    try:
+        return json.loads(db_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        LOG.warning("Failed to read voice db %s: %s", db_path, e)
+        return {"version": 1, "model_id": None, "speakers": {}}
 
-    # Prefer token if available, but model is usually public
-    model = None
-    if hf_token:
+
+def l2_normalize(v: np.ndarray) -> np.ndarray:
+    v = np.asarray(v, dtype=np.float32)
+    n = float(np.linalg.norm(v) + 1e-12)
+    return v / n
+
+
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    a = l2_normalize(a)
+    b = l2_normalize(b)
+    return float(np.dot(a, b))
+
+
+def match_speaker(
+    embedding: np.ndarray,
+    voice_db: Dict[str, Any],
+    threshold: float,
+) -> Tuple[Optional[str], float]:
+    """Returns: (best_name or None, best_score)"""
+    if embedding is None:
+        return None, 0.0
+    speakers = (voice_db or {}).get("speakers") or {}
+    best_name: Optional[str] = None
+    best_score: float = -1.0
+
+    for name, info in speakers.items():
+        embs = (info or {}).get("embeddings") or []
+        for e in embs:
+            try:
+                score = cosine_similarity(embedding, np.asarray(e, dtype=np.float32))
+            except Exception:
+                continue
+            if score > best_score:
+                best_score = score
+                best_name = str(name)
+
+    if best_name is not None and best_score >= threshold:
+        return best_name, best_score
+    return None, best_score if best_score > 0 else 0.0
+
+
+def diarization_to_spans(diarization: Any) -> List[Tuple[float, float, str]]:
+    """
+    Convert diarization output to list of (start, end, speaker_label).
+    Supports:
+      - pandas.DataFrame (start/end/speaker)
+      - pyannote.core.Annotation
+    """
+    spans: List[Tuple[float, float, str]] = []
+
+    # pandas DataFrame-like
+    if hasattr(diarization, "iterrows"):
         try:
-            model = Model.from_pretrained(VOICE_EMBED_MODEL_ID, use_auth_token=hf_token)
-        except TypeError:
-            model = Model.from_pretrained(VOICE_EMBED_MODEL_ID, token=hf_token)
+            for _, row in diarization.iterrows():
+                spans.append((float(row["start"]), float(row["end"]), str(row["speaker"])))
+            return spans
         except Exception:
-            model = None
-    if model is None:
-        model = Model.from_pretrained(VOICE_EMBED_MODEL_ID)
+            pass
 
-    inference = Inference(model, window="whole")
+    # pyannote.core.Annotation-like
+    if hasattr(diarization, "itertracks"):
+        try:
+            for segment, _, label in diarization.itertracks(yield_label=True):
+                spans.append((float(segment.start), float(segment.end), str(label)))
+            return spans
+        except Exception:
+            pass
 
-    if device.startswith("cuda") and torch.cuda.is_available():
-        inference.to(torch.device(device))
-    else:
-        inference.to(torch.device("cpu"))
-
-    return inference
+    return spans
 
 
-def compute_cluster_embedding(
-    inference,
-    wav_path: str,
-    segments: List[Tuple[float, float]],
+def pick_segments_for_embedding(
+    spans: List[Tuple[float, float, str]],
+    speaker: str,
     *,
-    min_segment_sec: float = 1.0,
-    max_crop_sec: float = 3.0,
-    max_total_sec: float = 30.0,
+    min_dur: float = 1.0,
+    max_segments: int = 5,
+    max_total_dur: float = 30.0,
+) -> List[Tuple[float, float]]:
+    """
+    Choose segments for a speaker to compute a stable embedding:
+    - take longest segments first
+    - limit count and total duration
+    """
+    candidates = [(s, e) for (s, e, spk) in spans if spk == speaker and (e - s) >= min_dur]
+    candidates.sort(key=lambda t: (t[1] - t[0]), reverse=True)
+
+    chosen: List[Tuple[float, float]] = []
+    total = 0.0
+    for s, e in candidates:
+        if len(chosen) >= max_segments:
+            break
+        dur = float(e - s)
+        if total + dur > max_total_dur and chosen:
+            break
+        chosen.append((float(s), float(e)))
+        total += dur
+
+    # fallback: if nothing long enough, take first few short segments
+    if not chosen:
+        short = [(s, e) for (s, e, spk) in spans if spk == speaker]
+        short.sort(key=lambda t: (t[1] - t[0]), reverse=True)
+        for s, e in short[: max_segments]:
+            chosen.append((float(s), float(e)))
+    return chosen
+
+
+def compute_speaker_embedding_pyannote(
+    audio_wav: Path,
+    spans: List[Tuple[float, float, str]],
+    speaker_label: str,
+    *,
+    model_id: str,
+    hf_token: str,
+    device: str,
+    min_dur: float = 1.0,
+    max_segments: int = 5,
 ) -> Optional[np.ndarray]:
     """
-    Вычисляет эмбеддинг "спикера" (кластера) как среднее из эмбеддингов по нескольким
-    самым длинным фрагментам речи.
+    Compute speaker embedding using pyannote Model + Inference.crop.
+    Uses averaging over a few segments.
     """
-    from pyannote.core import Segment
+    try:
+        import torch
+        from pyannote.audio import Model, Inference
+        from pyannote.core import Segment
+    except Exception as e:
+        LOG.warning("pyannote audio embedding imports failed: %s", e)
+        return None
 
+    segments = pick_segments_for_embedding(
+        spans,
+        speaker_label,
+        min_dur=min_dur,
+        max_segments=max_segments,
+    )
     if not segments:
         return None
 
-    # Берём сначала самые длинные куски
-    segs = sorted(segments, key=lambda x: (x[1] - x[0]), reverse=True)
+    try:
+        model = Model.from_pretrained(model_id, use_auth_token=hf_token)
+        inference = Inference(model, window="whole")
+        inference.to(torch.device(device))
+    except Exception as e:
+        LOG.warning("Failed to init embedding inference (%s): %s", model_id, e)
+        return None
 
     embs: List[np.ndarray] = []
-    total = 0.0
-
-    for start, end in segs:
-        dur = end - start
-        if dur < min_segment_sec:
-            continue
-
-        crop_end = min(end, start + max_crop_sec)
-        if crop_end <= start:
-            continue
-
-        emb = inference.crop(wav_path, Segment(start, crop_end))
-        vec = np.asarray(emb, dtype=np.float32).reshape(-1)
-        embs.append(vec)
-
-        total += (crop_end - start)
-        if total >= max_total_sec:
-            break
+    for s, e in segments:
+        try:
+            emb = inference.crop(str(audio_wav), Segment(float(s), float(e)))
+            emb = np.asarray(emb, dtype=np.float32).reshape(-1)
+            if emb.size > 0:
+                embs.append(emb)
+        except Exception:
+            LOG.exception("Embedding crop failed for %s [%.2f..%.2f]", speaker_label, s, e)
 
     if not embs:
         return None
 
-    return np.mean(np.stack(embs, axis=0), axis=0)
+    avg = np.mean(np.stack(embs, axis=0), axis=0)
+    return l2_normalize(avg)
 
 
-def identify_speakers(
-    diarization,
-    wav_path: str,
-    inference,
-    voice_db: Dict[str, Any],
-    threshold: float,
-) -> Tuple[Dict[str, str], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """
-    Возвращает:
-    - speaker_map: diar_label -> name_or_UNKNOWN_k
-    - unknowns: [{id,label,embedding,best_score}, ...]
-    - knowns:   [{label,name,score}, ...]
-    """
-    from voice_db import match_speaker
+def build_unknown_mapping(
+    speaker_labels: List[str],
+    known_map: Dict[str, str],
+) -> Dict[str, str]:
+    """speaker_label -> final_label"""
+    mapping: Dict[str, str] = {}
+    unknown_i = 1
+    for spk in speaker_labels:
+        if spk in known_map:
+            mapping[spk] = known_map[spk]
+        else:
+            mapping[spk] = f"UNKNOWN_{unknown_i}"
+            unknown_i += 1
+    return mapping
 
-    spk_segments: Dict[str, List[Tuple[float, float]]] = defaultdict(list)
-    for turn, _, spk in diarization.itertracks(yield_label=True):
-        spk_segments[str(spk)].append((float(turn.start), float(turn.end)))
 
-    speaker_map: Dict[str, str] = {}
-    unknowns: List[Dict[str, Any]] = []
-    knowns: List[Dict[str, Any]] = []
+def render_segments_to_text(segments: List[Dict[str, Any]]) -> str:
+    lines: List[str] = []
+    for seg in segments:
+        start = format_time(float(seg.get("start") or 0.0))
+        end = format_time(float(seg.get("end") or 0.0))
+        speaker = str(seg.get("speaker") or "UNKNOWN")
+        text = str(seg.get("text") or "").strip()
+        if not text:
+            continue
+        lines.append(f"[{start} - {end}] {speaker}: {text}")
+    return "\n".join(lines).strip() + "\n"
 
-    unknown_idx = 1
 
-    for label in sorted(spk_segments.keys()):
-        emb = compute_cluster_embedding(inference, wav_path, spk_segments[label])
-        if emb is None:
-            unk_id = f"UNKNOWN_{unknown_idx}"
-            unknown_idx += 1
-            speaker_map[label] = unk_id
-            unknowns.append(
-                {"id": unk_id, "label": label, "embedding": None, "best_score": None}
+def compact_segments(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Merge adjacent segments with same speaker when close in time."""
+    if not segments:
+        return []
+
+    merged: List[Dict[str, Any]] = []
+    cur = dict(segments[0])
+    cur["text"] = str(cur.get("text") or "").strip()
+
+    def flush():
+        nonlocal cur
+        if cur and str(cur.get("text") or "").strip():
+            merged.append(
+                {
+                    "start": float(cur.get("start") or 0.0),
+                    "end": float(cur.get("end") or 0.0),
+                    "speaker": cur.get("speaker"),
+                    "text": str(cur.get("text") or "").strip(),
+                }
             )
+
+    for seg in segments[1:]:
+        spk = seg.get("speaker")
+        text = str(seg.get("text") or "").strip()
+        if not text:
             continue
 
-        emb_list = emb.astype(np.float32).tolist()
-        name, score = match_speaker(voice_db, emb_list, threshold)
-
-        if name is not None:
-            speaker_map[label] = name
-            knowns.append({"label": label, "name": name, "score": score})
+        gap = float(seg.get("start") or 0.0) - float(cur.get("end") or 0.0)
+        if spk == cur.get("speaker") and gap <= 0.8:
+            cur["end"] = float(seg.get("end") or cur.get("end") or 0.0)
+            cur["text"] = (str(cur.get("text") or "") + " " + text).strip()
         else:
-            unk_id = f"UNKNOWN_{unknown_idx}"
-            unknown_idx += 1
-            speaker_map[label] = unk_id
-            unknowns.append(
-                {"id": unk_id, "label": label, "embedding": emb_list, "best_score": score}
-            )
+            flush()
+            cur = dict(seg)
+            cur["text"] = text
 
-    return speaker_map, unknowns, knowns
+    flush()
+    return merged
 
 
-def apply_speaker_map(segments: List[Dict[str, Any]], speaker_map: Dict[str, str]) -> None:
-    """
-    Модифицирует segments in-place:
-    - сохраняет исходную метку в speaker_label
-    - заменяет speaker на имя/UNKNOWN_k
-    """
-    for s in segments:
-        orig = s.get("speaker")
-        s["speaker_label"] = orig
-        if orig in speaker_map:
-            s["speaker"] = speaker_map[orig]
+def ensure_segment_speaker_from_words(seg: Dict[str, Any]) -> None:
+    """If segment-level speaker missing but word-level exists, infer majority."""
+    if seg.get("speaker"):
+        return
+    words = seg.get("words") or []
+    speakers = [w.get("speaker") for w in words if isinstance(w, dict) and w.get("speaker")]
+    if not speakers:
+        return
+    counts: Dict[str, int] = {}
+    for s in speakers:
+        counts[str(s)] = counts.get(str(s), 0) + 1
+    best = max(counts.items(), key=lambda kv: kv[1])[0]
+    seg["speaker"] = best
 
 
-# --------------------------- output ---------------------------
-def write_result_txt(segments: List[Dict[str, Any]], path: Path) -> None:
-    lines = []
-    for s in segments:
-        lines.append(
-            f"[{format_ts(s['start'])} --> {format_ts(s['end'])}] {s['speaker']}: {s.get('text','')}"
+def parse_args(argv: List[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="WhisperX ASR + diarization + speaker embeddings.")
+    p.add_argument("audio_path", type=str, help="Path to input audio")
+    p.add_argument("language", nargs="?", default=env_str("ASR_LANG", "ru"), help="Language code (e.g., ru)")
+    p.add_argument(
+        "output_dir",
+        nargs="?",
+        default=env_str("ASR_OUTPUT_DIR", "."),
+        help="Directory for result.txt/result.json",
+    )
+
+    p.add_argument("--model", default=env_str("WHISPERX_MODEL", "large-v2"))
+    p.add_argument("--device", default=env_str("DEVICE", None))
+    p.add_argument("--compute-type", default=env_str("WHISPERX_COMPUTE_TYPE", None))
+    p.add_argument("--batch-size", type=int, default=env_int("WHISPERX_BATCH_SIZE", 16))
+
+    p.add_argument("--vad-method", default=env_str("WHISPERX_VAD_METHOD", "pyannote"))
+
+    p.add_argument("--min-speakers", type=int, default=env_int("DIARIZE_MIN_SPEAKERS", 0))
+    p.add_argument("--max-speakers", type=int, default=env_int("DIARIZE_MAX_SPEAKERS", 0))
+
+    p.add_argument("--voice-db", default=env_str("VOICE_DB_PATH", "voice_db.json"))
+    p.add_argument("--sim-threshold", type=float, default=env_float("SPEAKER_SIM_THRESHOLD", 0.76))
+
+    p.add_argument("--embedding-model", default=env_str("VOICE_EMBEDDING_MODEL", None))
+    p.add_argument("--embedding-min-dur", type=float, default=env_float("VOICE_EMB_MIN_DUR", 1.0))
+    p.add_argument("--embedding-max-seg", type=int, default=env_int("VOICE_EMB_MAX_SEG", 5))
+
+    p.add_argument("--no-voice-matching", action="store_true", help="Do not match speakers from voice_db")
+    p.add_argument("--no-embeddings", action="store_true", help="Do not compute embeddings (unknown_speakers empty)")
+
+    p.add_argument("--log-level", default=env_str("LOG_LEVEL", "INFO"))
+
+    return p.parse_args(argv)
+
+
+def main(argv: List[str]) -> int:
+    args = parse_args(argv)
+
+    logging.basicConfig(
+        level=getattr(logging, str(args.log_level).upper(), logging.INFO),
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+
+    audio_path = Path(args.audio_path).expanduser().resolve()
+    out_dir = Path(args.output_dir).expanduser().resolve()
+    ensure_dir(out_dir)
+
+    if not audio_path.exists():
+        LOG.error("Audio file not found: %s", audio_path)
+        return 2
+
+    # device
+    device = args.device
+    if not device:
+        try:
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            device = "cpu"
+
+    # compute_type
+    compute_type = args.compute_type
+    if not compute_type:
+        compute_type = "float16" if device.startswith("cuda") else "int8"
+
+    model_name = str(args.model)
+    language = str(args.language) if args.language else None
+    vad_method = str(args.vad_method).strip().lower()
+
+    hf_token = env_str("HF_TOKEN", "")
+    if not hf_token:
+        LOG.error("HF_TOKEN is missing. Set HF_TOKEN in environment/.env for pyannote models.")
+        return 3
+
+    voice_db_path = Path(args.voice_db).expanduser()
+    if not voice_db_path.is_absolute():
+        voice_db_path = (Path.cwd() / voice_db_path).resolve()
+
+    voice_db = load_voice_db(voice_db_path)
+    db_model_id = (voice_db or {}).get("model_id")
+    emb_model_id = args.embedding_model or db_model_id or "pyannote/wespeaker-voxceleb-resnet34-LM"
+
+    if db_model_id and args.embedding_model and str(args.embedding_model) != str(db_model_id):
+        LOG.warning(
+            "VOICE_EMBEDDING_MODEL (%s) differs from voice_db.model_id (%s). Matching may degrade.",
+            args.embedding_model,
+            db_model_id,
         )
-    path.write_text("\n".join(lines), encoding="utf-8")
-    print(f"Wrote {path}")
 
-
-def write_result_json(
-    audio_path: str,
-    language: Optional[str],
-    segments: List[Dict[str, Any]],
-    path: Path,
-    *,
-    speaker_map: Optional[Dict[str, str]] = None,
-    unknown_speakers: Optional[List[Dict[str, Any]]] = None,
-    known_speakers: Optional[List[Dict[str, Any]]] = None,
-    speaker_threshold: Optional[float] = None,
-    voice_embed_model: Optional[str] = None,
-) -> None:
-    payload: Dict[str, Any] = {
-        "audio_path": os.path.abspath(audio_path),
-        "language": language,
-        "segments": segments,
-    }
-    if speaker_map is not None:
-        payload["speaker_map"] = speaker_map
-    if unknown_speakers is not None:
-        payload["unknown_speakers"] = unknown_speakers
-    if known_speakers is not None:
-        payload["known_speakers"] = known_speakers
-    if speaker_threshold is not None:
-        payload["speaker_threshold"] = speaker_threshold
-    if voice_embed_model is not None:
-        payload["voice_embed_model"] = voice_embed_model
-
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"Wrote {path}")
-
-
-# --------------------------- cli ---------------------------
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="WhisperX large-v2 + pyannote diarization 3.1 (+ speaker id)")
-    p.add_argument("--audio_path", type=str, required=True, help="Path to input audio file")
-    p.add_argument("--device", type=str, default=None, help="ASR device: cuda/cpu (default auto)")
-    p.add_argument("--compute_type", type=str, default=None, help="float16/float32/int8 (default auto)")
-    p.add_argument("--batch_size", type=int, default=16, help="WhisperX batch size")
-    p.add_argument("--language", type=str, default=None, help="Language code (e.g., ru, en). If not set -> detect")
-    p.add_argument("--skip_diarization", action="store_true", help="Run ASR only (no diarization)")
-    p.add_argument(
-        "--asr_vad",
-        type=str,
-        default="silero",
-        choices=["silero", "pyannote"],
-        help="VAD method inside WhisperX for ASR segmentation. Default silero (recommended).",
+    LOG.info("Input: %s", audio_path)
+    LOG.info("Output dir: %s", out_dir)
+    LOG.info("Device: %s | compute_type: %s", device, compute_type)
+    LOG.info("WhisperX model: %s | lang: %s | vad_method: %s", model_name, language, vad_method)
+    LOG.info("Diarization: pyannote/speaker-diarization-3.1 (via WhisperX)")
+    LOG.info(
+        "Voice DB: %s | speakers: %s | sim_threshold: %.3f",
+        voice_db_path,
+        len((voice_db.get("speakers") or {})),
+        args.sim_threshold,
     )
-    p.add_argument(
-        "--diarization_device",
-        type=str,
-        default="auto",
-        choices=["auto", "cuda", "cpu"],
-        help="Diarization device preference. auto=use cuda if available else cpu.",
-    )
-    p.add_argument(
-        "--max_speaker_gap",
-        type=float,
-        default=1.0,
-        help="Max silence gap (sec) to keep words in the same speaker segment.",
-    )
+    LOG.info("Embedding model: %s", emb_model_id)
 
-    # NEW:
-    p.add_argument("--out_dir", type=str, default=".", help="Output directory (per-job folder recommended).")
-    p.add_argument("--voice_db_path", type=str, default="voice_db.json", help="Path to voice DB (JSON).")
-    p.add_argument("--speaker_threshold", type=float, default=0.75, help="Cosine similarity threshold for speaker ID.")
-    p.add_argument("--disable_speaker_id", action="store_true", help="Disable mapping to known speaker names.")
+    # 1) Convert to wav 16k mono
+    wav_path = out_dir / "audio_16k.wav"
+    try:
+        run_ffmpeg_to_wav16k_mono(audio_path, wav_path)
+    except Exception:
+        LOG.exception("ffmpeg conversion failed")
+        return 10
 
-    return p.parse_args()
-
-
-# --------------------------- main ---------------------------
-def main() -> None:
-    args = parse_args()
-    print_environment()
-
-    if not os.path.isfile(args.audio_path):
-        print(f"ERROR: audio file not found: {args.audio_path}")
-        sys.exit(1)
-
-    out_dir = Path(args.out_dir).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_txt = out_dir / "result.txt"
-    out_json = out_dir / "result.json"
-
-    asr_device = choose_device(args.device)
-    compute_type = args.compute_type or ("float16" if asr_device.startswith("cuda") else "int8")
-    print(f"Compute type : {compute_type}")
-
-    hf_token = get_hf_token(skip_diarization=args.skip_diarization)
-
-    wav_path, is_tmp = convert_to_wav_16k_mono(args.audio_path)
-
+    # 2) WhisperX transcription + alignment + diarization
     try:
         import whisperx
+    except Exception as e:
+        LOG.error("Missing dependencies: %s", e)
+        return 11
 
-        print(f"Loading audio : {wav_path}")
-        audio = whisperx.load_audio(wav_path)
+    try:
+        audio = whisperx.load_audio(str(wav_path))
+    except Exception:
+        LOG.exception("Failed to load audio with whisperx")
+        return 12
 
-        print("Loading WhisperX ASR model (large-v2) ...")
-        model = whisperx.load_model(
-            "large-v2",
-            device=asr_device,
+    # Load ASR model (with pyannote VAD to avoid silero torch.hub)
+    try:
+        load_kwargs = dict(
+            device=device,
             compute_type=compute_type,
-            vad_method=args.asr_vad,
+            language=language,
+            vad_method=vad_method,
         )
+        # Для pyannote VAD нужен HF токен (модель сегментации часто gated).
+        if vad_method == "pyannote":
+            load_kwargs["vad_options"] = {"use_auth_token": hf_token}
 
-        print("Running transcription ...")
-        result = model.transcribe(audio, batch_size=args.batch_size, language=args.language)
-        language = result.get("language", args.language)
-        if language:
-            print(f"Detected language: {language}")
+        model = whisperx.load_model(
+            model_name,
+            **load_kwargs,
+        )
+    except TypeError:
+        LOG.error("Your whisperx.load_model does not support vad_method/vad_options. Please upgrade whisperx to 3.7.4+.")
+        return 13
+    except Exception:
+        LOG.exception("Failed to load WhisperX model")
+        return 14
 
-        # Alignment (word-level)
-        aligned = result
-        word_level_ok = False
+    try:
+        result = model.transcribe(audio, batch_size=int(args.batch_size), language=language)
+    except Exception:
+        LOG.exception("ASR transcribe failed")
+        return 15
+
+    # Alignment
+    try:
+        align_model, metadata = whisperx.load_align_model(language_code=language or result.get("language"), device=device)
+        result = whisperx.align(
+            result.get("segments", []),
+            align_model,
+            metadata,
+            audio,
+            device,
+            return_char_alignments=False,
+        )
+    except Exception:
+        LOG.exception("Alignment failed (continuing without alignment)")
+
+    # Diarization
+    diarization = None
+    diarize_min = int(args.min_speakers) if args.min_speakers else 0
+    diarize_max = int(args.max_speakers) if args.max_speakers else 0
+
+    try:
         try:
-            print("Loading alignment model ...")
-            align_model, metadata = whisperx.load_align_model(language_code=language, device=asr_device)
-            print("Running alignment ...")
-            aligned = whisperx.align(
-                result["segments"],
-                align_model,
-                metadata,
-                audio,
-                asr_device,
-                return_char_alignments=False,
+            diarize_pipeline = whisperx.DiarizationPipeline(use_auth_token=hf_token, device=device)
+        except TypeError:
+            diarize_pipeline = whisperx.DiarizationPipeline(token=hf_token, device=device)
+
+        diar_kwargs = {}
+        if diarize_min > 0:
+            diar_kwargs["min_speakers"] = diarize_min
+        if diarize_max > 0:
+            diar_kwargs["max_speakers"] = diarize_max
+
+        diarization = diarize_pipeline(str(wav_path), **diar_kwargs)
+        result = whisperx.assign_word_speakers(diarization, result)
+    except Exception:
+        LOG.exception("Diarization failed (continuing with UNKNOWN speakers)")
+        diarization = None
+
+    # Ensure segment-level speaker exists
+    segments: List[Dict[str, Any]] = []
+    for seg in (result or {}).get("segments", []) or []:
+        if not isinstance(seg, dict):
+            continue
+        ensure_segment_speaker_from_words(seg)
+        segments.append(seg)
+
+    # 3) Compute embeddings per diarization speaker + match to voice_db
+    spans = diarization_to_spans(diarization) if diarization is not None else []
+
+    # collect speaker labels from segments
+    speaker_labels = []
+    for seg in segments:
+        spk = seg.get("speaker")
+        if spk and str(spk) not in speaker_labels:
+            speaker_labels.append(str(spk))
+
+    # Deterministic order
+    speaker_labels = sorted(speaker_labels)
+
+    known_map: Dict[str, str] = {}
+    speaker_scores: Dict[str, float] = {}
+    unknown_speakers: List[Dict[str, Any]] = []
+    embeddings_by_label: Dict[str, Optional[np.ndarray]] = {}
+
+    if not args.no_embeddings and spans and speaker_labels:
+        for spk in speaker_labels:
+            emb = compute_speaker_embedding_pyannote(
+                wav_path,
+                spans,
+                spk,
+                model_id=str(emb_model_id),
+                hf_token=hf_token,
+                device=device,
+                min_dur=float(args.embedding_min_dur),
+                max_segments=int(args.embedding_max_seg),
             )
-            word_level_ok = True
-        except Exception as e:
-            print("WARNING: alignment failed, fallback to segment-level.")
-            print(f" Reason: {e}")
-            aligned = result
-            word_level_ok = False
+            embeddings_by_label[spk] = emb
 
-        # Build output segments
-        speaker_map = None
-        unknown_speakers = None
-        known_speakers = None
+            if emb is not None and (not args.no_voice_matching):
+                name, score = match_speaker(emb, voice_db, threshold=float(args.sim_threshold))
+                if name:
+                    known_map[spk] = name
+                    speaker_scores[spk] = score
+    else:
+        for spk in speaker_labels:
+            embeddings_by_label[spk] = None
 
-        if args.skip_diarization:
-            print("Skipping diarization. Speakers will be SPEAKER_UNKNOWN.")
-            segments_out: List[Dict[str, Any]] = []
-            for s in aligned.get("segments", []) or []:
-                segments_out.append(
-                    {
-                        "speaker": "SPEAKER_UNKNOWN",
-                        "start": float(s.get("start", 0.0)),
-                        "end": float(s.get("end", 0.0)),
-                        "text": (s.get("text") or "").strip(),
-                        "words": s.get("words") or [],
-                    }
-                )
+    final_map = build_unknown_mapping(speaker_labels, known_map)
 
-        else:
-            if args.diarization_device == "cpu":
-                diar_dev = "cpu"
-            elif args.diarization_device == "cuda":
-                diar_dev = "cuda"
-            else:
-                diar_dev = "cuda" if torch.cuda.is_available() else "cpu"
+    # Prepare unknown_speakers list (for later manual labeling in bot)
+    for spk in speaker_labels:
+        final = final_map.get(spk, spk)
+        if final.startswith("UNKNOWN_"):
+            emb = embeddings_by_label.get(spk)
+            unknown_speakers.append(
+                {
+                    "id": final,
+                    "source_speaker": spk,
+                    "embedding": emb.tolist() if isinstance(emb, np.ndarray) else None,
+                }
+            )
 
-            pipeline = create_pyannote_pipeline(hf_token, diar_dev)
-            print("Running pyannote diarization ...")
-            diarization = diarize_with_retry(pipeline, wav_path)
+    # 4) Apply mapping to segments & compact transcript
+    mapped_segments: List[Dict[str, Any]] = []
+    for seg in segments:
+        spk = str(seg.get("speaker") or "")
+        seg2 = {
+            "start": float(seg.get("start") or 0.0),
+            "end": float(seg.get("end") or 0.0),
+            "speaker": final_map.get(spk, spk or "UNKNOWN"),
+            "text": str(seg.get("text") or ""),
+        }
+        mapped_segments.append(seg2)
 
-            # Assign speakers
-            if word_level_ok and any((seg.get("words") for seg in aligned.get("segments", []) or [])):
-                words = assign_word_speakers(diarization, aligned)
-                segments_out = merge_words_into_speaker_segments(words, max_gap=float(args.max_speaker_gap))
-            else:
-                # segment-level fallback
-                segments_out = []
-                for s in aligned.get("segments", []) or []:
-                    start = float(s.get("start", 0.0))
-                    end = float(s.get("end", start))
-                    mid = 0.5 * (start + end)
+    mapped_segments = sorted(mapped_segments, key=lambda s: float(s.get("start") or 0.0))
+    compact = compact_segments(mapped_segments)
 
-                    spk = "SPEAKER_UNKNOWN"
-                    for turn, _, speaker in diarization.itertracks(yield_label=True):
-                        if float(turn.start) <= mid < float(turn.end):
-                            spk = str(speaker)
-                            break
+    # 5) Save outputs
+    result_txt_path = out_dir / "result.txt"
+    result_json_path = out_dir / "result.json"
 
-                    segments_out.append(
-                        {
-                            "speaker": spk,
-                            "start": start,
-                            "end": end,
-                            "text": (s.get("text") or "").strip(),
-                            "words": s.get("words") or [],
-                        }
-                    )
+    transcript_text = render_segments_to_text(compact)
+    result_txt_path.write_text(transcript_text, encoding="utf-8")
 
-            # NEW: speaker identification
-            if not args.disable_speaker_id:
-                from voice_db import load_db
+    payload: Dict[str, Any] = {
+        "version": 2,
+        "input_audio": str(audio_path),
+        "audio_16k_wav": str(wav_path),
+        "language": language or result.get("language"),
+        "whisperx_model": model_name,
+        "device": device,
+        "compute_type": compute_type,
+        "vad_method": vad_method,
+        "diarization": {
+            "pipeline": "pyannote/speaker-diarization-3.1",
+            "min_speakers": diarize_min if diarize_min > 0 else None,
+            "max_speakers": diarize_max if diarize_max > 0 else None,
+        },
+        "voice_db": {
+            "path": str(voice_db_path),
+            "model_id": db_model_id,
+            "sim_threshold": float(args.sim_threshold),
+        },
+        "embedding_model": str(emb_model_id) if emb_model_id else None,
+        "speaker_map": final_map,
+        "speaker_scores": speaker_scores,
+        "unknown_speakers": unknown_speakers,
+        "segments": compact,
+    }
 
-                voice_db = load_db(Path(args.voice_db_path))
-                inference = create_embedding_inference(hf_token, diar_dev)
-                speaker_map, unknown_speakers, known_speakers = identify_speakers(
-                    diarization=diarization,
-                    wav_path=wav_path,
-                    inference=inference,
-                    voice_db=voice_db,
-                    threshold=float(args.speaker_threshold),
-                )
-                apply_speaker_map(segments_out, speaker_map)
+    result_json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        # Save outputs
-        write_result_txt(segments_out, out_txt)
-        write_result_json(
-            args.audio_path,
-            language,
-            segments_out,
-            out_json,
-            speaker_map=speaker_map,
-            unknown_speakers=unknown_speakers,
-            known_speakers=known_speakers,
-            speaker_threshold=None if args.disable_speaker_id else float(args.speaker_threshold),
-            voice_embed_model=None if args.disable_speaker_id else VOICE_EMBED_MODEL_ID,
-        )
+    LOG.info("Saved: %s", result_txt_path)
+    LOG.info("Saved: %s", result_json_path)
+    LOG.info("Unknown speakers: %s", len([u for u in unknown_speakers if u.get("id")]))
 
-    finally:
-        if is_tmp:
-            try:
-                os.remove(wav_path)
-            except Exception:
-                pass
+    return 0
 
 
 if __name__ == "__main__":
     try:
-        main()
+        raise SystemExit(main(sys.argv[1:]))
     except KeyboardInterrupt:
-        print("Interrupted by user.")
-        sys.exit(1)
+        raise SystemExit(130)
